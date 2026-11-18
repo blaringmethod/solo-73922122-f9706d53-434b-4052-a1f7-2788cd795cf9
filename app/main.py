@@ -1,15 +1,24 @@
-"""FastAPI 入口：补录、唯一索引构建的发起/查询/取消。"""
+"""FastAPI 入口：补录、唯一索引构建、质控放行与供数。"""
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import date
 
 import psycopg
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 
-from . import db
+from . import db, qc
+from .qc import ScopeBusyError
 from .responses import AppJSONResponse
-from .schemas import BatchReportIn, ReportIn, ReportOut
+from .schemas import (
+    BatchReportIn,
+    QcReleaseOut,
+    QcVerifyIn,
+    ReportIn,
+    ReportOut,
+    SupplyListOut,
+)
 from .service import service
 
 logging.basicConfig(
@@ -21,6 +30,8 @@ log = logging.getLogger("api")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # 幂等建表/建触发器：首次启动由 initdb 执行，这里保证本地、测试与升级场景同样可用。
+    db.ensure_schema()
     db.init_pool()
     service.reconcile_on_startup()
     try:
@@ -30,13 +41,15 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="检验报告唯一性保障 API",
+    title="检验报告唯一性保障与质控放行 API",
     description=(
         "对持续补录的 reports 表在线构建 (lab_no, report_no) 唯一索引；"
-        "支持发起、查询、取消 CREATE UNIQUE INDEX CONCURRENTLY，"
-        "构建期间补录不阻塞，API 重启后接续跟踪。"
+        "支持发起、查询、取消 CREATE UNIQUE INDEX CONCURRENTLY，构建期间补录不阻塞，"
+        "API 重启后接续跟踪。另提供质控放行：按 (实验室号, UTC 日期, 整数上下限) "
+        "核对原始测值，全部合格才放行，供数接口只返回当前获放行的报告；"
+        "独立 SQL 对 reports 的增改删随原事务撤销受影响作用域的放行。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     default_response_class=AppJSONResponse,
     lifespan=lifespan,
 )
@@ -102,6 +115,7 @@ def insert_reports_batch(payload: BatchReportIn):
 
 @app.get("/reports")
 def list_reports(limit: int = 50, offset: int = 0):
+    """管理视图：分页查询全部报告（不经质控过滤；供数请用 /reports/supply）。"""
     with db.pool().connection() as conn:
         rows = conn.execute(
             "SELECT id, lab_no, report_no, measured FROM reports "
@@ -110,6 +124,89 @@ def list_reports(limit: int = 50, offset: int = 0):
         ).fetchall()
         total = conn.execute("SELECT count(*) AS n FROM reports").fetchone()["n"]
     return {"total": total, "items": [dict(r) for r in rows]}
+
+
+@app.get("/reports/supply", response_model=SupplyListOut)
+def supply_reports(
+    lab_no: str | None = Query(None, description="可选：按实验室号过滤"),
+    report_date: date | None = Query(None, description="可选：按 UTC 日期过滤 (YYYY-MM-DD)"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """供数接口：只返回**当前获放行**作用域内的报告。
+
+    报告按其 ``created_at`` 的 UTC 日历日匹配 ``qc_releases`` 中
+    ``status='released'`` 的行；撤销或从未核验的作用域一律不返回。
+    """
+    return qc.supply_reports(limit, offset, lab_no, report_date)
+
+
+# ------------------------------ 质控放行 ---------------------------------
+
+@app.post("/qc/verify", response_model=QcReleaseOut)
+def qc_verify(payload: QcVerifyIn):
+    """提交实验室号、UTC 日期与整数上下限，按 reports.created_at 核对该作用域原始行。
+
+    * 全部合格 -> 记录/更新为 ``released``，供数接口立即可见；
+    * 无报告或存在越界值 -> 撤销该作用域原放行，返回越界报告 id；
+    * 范围改变（重复提交）-> 按新范围重新核验并覆盖旧结论；
+    * 同一作用域有长事务正在增改删 reports、锁等待超时 -> 409（不跳过、不放行）。
+
+    整个核验是单事务：执行故障整体回滚，不留下部分核验结果。
+    """
+    try:
+        view = qc.verify_and_release(
+            payload.lab_no,
+            payload.report_date,
+            payload.lower_bound,
+            payload.upper_bound,
+        )
+    except ScopeBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "qc_scope_busy",
+                "message": "该作用域正被长事务占用（reports 增改删未提交），请稍后重试",
+                "lab_no": payload.lab_no,
+                "report_date": payload.report_date.isoformat(),
+                "pg_error": str(exc),
+            },
+        )
+    return view
+
+
+# ------------------------------ 质控查询 ---------------------------------
+
+@app.get("/qc/releases")
+def qc_list_releases(
+    status_filter: str | None = Query(None, alias="status",
+                                      description="可选：released / revoked"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """分页查看各作用域当前放行/撤销状态。"""
+    if status_filter and status_filter not in ("released", "revoked"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_status",
+                    "message": "status 仅支持 released / revoked"},
+        )
+    return qc.list_releases(limit, offset, status_filter)
+
+
+@app.get("/qc/releases/{lab_no}/{report_date}", response_model=QcReleaseOut)
+def qc_get_release(lab_no: str, report_date: date):
+    """查询单个作用域的当前质控结论；从未核验返回 404。"""
+    view = qc.get_release(lab_no, report_date)
+    if view is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "qc_release_not_found",
+                    "message": "该作用域尚未进行质控核验",
+                    "lab_no": lab_no,
+                    "report_date": report_date.isoformat()},
+        )
+    return view
 
 
 # --------------------------- 唯一索引构建 --------------------------------

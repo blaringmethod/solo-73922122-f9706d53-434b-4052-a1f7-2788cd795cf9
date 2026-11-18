@@ -25,6 +25,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/report_warehouse
       BUILD_LOCK_TIMEOUT_MS: "0"
+      QC_LOCK_TIMEOUT_MS: "10000"
       RECONCILE_INTERVAL_S: "1.5"
     ports:
       - "8000:8000"

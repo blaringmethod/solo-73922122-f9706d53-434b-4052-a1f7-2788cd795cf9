@@ -54,7 +54,8 @@ while time.time() < deadline and not (sig / "commit").exists():
 conn.commit(); conn.close()
 PY
 BF_HOLDER=$!
-for _ in $(seq 1 20); do [[ -f "$BF_SIG/pid" ]] && break; sleep 0.3; doneBACKFILL_PID="$(cat "$BF_SIG/pid")"
+for _ in $(seq 1 20); do [[ -f "$BF_SIG/pid" ]] && break; sleep 0.3; done
+BACKFILL_PID="$(cat "$BF_SIG/pid")"
 echo "补录事务 PID = $BACKFILL_PID（取消后应依然存活）"
 
 echo "== 4. 取消：先得到 202 cancel_requested（绝不提前报 cancelled） =="
